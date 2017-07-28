@@ -1,0 +1,329 @@
+---
+title: "Bank Marketing"
+author: "Joshua Williams, Raymond Obidegwu, Heath McCasland"
+date: "July 1, 2017"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+##Import dependencies
+```{r}
+library(ResourceSelection)
+library(h2o)
+```
+
+
+## Read in the data 
+The data was donated in 2012 to UCI by a portuguese bank. It in most likely BPI given the size of the company. 
+```{r}
+bank = read.table("C:/Users/willi/Desktop/bank-additional/bank-additional/bank-additional-full.csv", sep=";",header=T)
+
+```
+
+Input variables:
+###bank client data:
+1 - age (numeric)
+2 - job : type of job (categorical: 'admin.','blue-collar','entrepreneur','housemaid','management','retired','self-employed','services','student','technician','unemployed','unknown')
+3 - marital : marital status (categorical: 'divorced','married','single','unknown'; note: 'divorced' means divorced or widowed)
+4 - education (categorical: 'basic.4y','basic.6y','basic.9y','high.school','illiterate','professional.course','university.degree','unknown')
+5 - default: has credit in default? (categorical: 'no','yes','unknown')
+6 - housing: has housing loan? (categorical: 'no','yes','unknown')
+7 - loan: has personal loan? (categorical: 'no','yes','unknown')
+###related with the last contact of the current campaign:
+8 - contact: contact communication type (categorical: 'cellular','telephone') 
+9 - month: last contact month of year (categorical: 'jan', 'feb', 'mar', ..., 'nov', 'dec')
+10 - day_of_week: last contact day of the week (categorical: 'mon','tue','wed','thu','fri')
+11 - duration: last contact duration, in seconds (numeric). Important note: this attribute highly affects the output target (e.g., if duration=0 then y='no'). Yet, the duration is not known before a call is performed. Also, after the end of the call y is obviously known. Thus, this input should only be included for benchmark purposes and should be discarded if the intention is to have a realistic predictive model.
+###other attributes:
+12 - campaign: number of contacts performed during this campaign and for this client (numeric, includes last contact)
+13 - pdays: number of days that passed by after the client was last contacted from a previous campaign (numeric; 999 means client was not previously contacted)
+14 - previous: number of contacts performed before this campaign and for this client (numeric)
+15 - poutcome: outcome of the previous marketing campaign (categorical: 'failure','nonexistent','success')
+###social and economic context attributes
+16 - emp.var.rate: employment variation rate - quarterly indicator (numeric)
+17 - cons.price.idx: consumer price index - monthly indicator (numeric) 
+18 - cons.conf.idx: consumer confidence index - monthly indicator (numeric) 
+19 - euribor3m: euribor 3 month rate - daily indicator (numeric)
+20 - nr.employed: number of employees - quarterly indicator (numeric)
+
+Output variable (desired target):
+21 - y - has the client subscribed a term deposit? (binary: 'yes','no')
+
+```{r}
+str(bank)
+
+```
+
+###Data Cleaning
+As mentioned above the duration is a very good predictor, but not important considering our business question. It is intuitive that if a call only last a few seconds there was probably no sale made. If a call last longer a sale is more likely to have been made, becuase more time is available to awnser the customers concerns before they invest. 
+```{r}
+table(bank[which(bank$duration < 38),]$y)
+```
+
+There would be no way to know the duration of the call before the call is made. The calls made with less than 4 seconds are deleted. 
+```{r}
+rows=row.names(bank[which(bank$duration < 4),])
+rows=as.integer(rows)
+bank = bank[-rows,]
+dim(bank)
+
+```
+
+Duration is not used becuase it is not known how long a phone call will last before it is made. The month and day of the week columns are also deleted, because they are irelevant to the business question on hand. 
+
+```{r}
+bank$duration = NULL
+bank$month=NULL
+bank$day_of_week=NULL
+```
+
+Normalize the data.
+```{r}
+norm= function(x){
+  return((x-min(x))/ (max(x)- min(x)))}
+
+for (i in 1:dim(bank)[2]){ bank[,i]=as.numeric(bank[,i])}
+
+banknorm= data.frame((lapply(bank[,1:(dim(bank)[2]-1)], norm)))
+banknorm$y= bank$y
+```
+
+
+###Data Exploratoion
+
+It appears there is some correlation of between the social economic factors. 
+
+```{r}
+corrplot::corrplot(stats::cor(banknorm),method="number")
+```
+
+Bank Client Data and Predictor 
+```{r}
+ResourceSelection::kdepairs(banknorm[,c(1,2,3,4,6,18)])
+stats::cor(banknorm)[c(5,7),]
+```
+Correlation between 
+```{r}
+corrplot::corrplot(stats::cor(banknorm[7:12]),method="number")
+```
+
+
+
+There appears to be some multicollinearity between the social and economic factors. 
+```{r}
+ResourceSelection::kdepairs(banknorm[13:18])
+```
+
+
+```{r}
+
+pcse= princomp(banknorm[13:17])
+summary(pcse)
+Socio_Economic = pcse$scores[,1:2] #92% cumulative variennce
+#remove old socio economic 
+banknorm[13:17]=NULL
+banknorm$SEC1=Socio_Economic[,1]
+banknorm$SEC2=Socio_Economic[,2]
+```
+
+The correlation plot shows that the priciple components fixed the multicollinearity. 
+```{r}
+corrplot::corrplot(stats::cor(banknorm),method="number")
+```
+
+Return y to factor so Neural net can output probability with softmax.
+```{r}
+banknorm$y=as.factor(banknorm$y)
+```
+
+
+Split the data into train and test.
+
+```{r}
+idx = sample(1:nrow(banknorm), 0.7*nrow(banknorm))
+
+train=banknorm[idx,]
+test=banknorm[-idx,]
+dim(test)
+dim(train)
+
+```
+
+
+
+```{r}
+h2o.init()
+x.hex = as.h2o(train)
+test.hex = as.h2o(test)
+
+deep = h2o.deeplearning(training_frame=x.hex,
+                 x=c(1:12,14,15),
+                 y=13,
+                 epochs = 10,
+                 activation="Rectifier",
+                 hidden=c(10,10),
+                 rate = .03,
+                 adaptive_rate = T,
+                 nesterov_accelerated_gradient = T,
+                 initial_weight_distribution = "UniformAdaptive")
+```
+
+Predict the test data. 
+```{r}
+pred= predict(deep, test.hex)
+
+```
+
+The AUC Curve is plotted below. As seen the model has a decent performance. 
+
+```{r}
+perf = h2o.performance(deep, test.hex)
+plot(perf)
+```
+
+The model has good performance, the model guessed that 
+```{r}
+perf
+```
+
+The original data will be used with the same index as test in order to see the data without normilazation.It appears the model ouput
+The people most likely to buy are:
+age: 42
+job: Admin, then Blue collar
+Marital: Married
+Education: University Degree
+Default: NO
+loan : NO
+conatct: Cellular
+Number of contact performed: 1
+Number of days passed before client was previously contacted: 999
+poutcome: nonexistent
+
+
+
+```{r}
+testdenorm=bank[-idx,] 
+testdenorm$pred=as.data.frame(pred)$predict
+test$pred=as.data.frame(pred)$predict
+yes=dplyr::filter(testdenorm, pred==2)
+mean(yes$age)
+hist(yes$age)
+
+```
+
+
+
+```{r}
+nb = h2o.naiveBayes(training_frame=x.hex,
+                 x=c(1:12,14,15),
+                 y=13)
+
+```
+
+
+```{r}
+perfnb = h2o.performance(nb, test.hex)
+plot(perfnb)
+perfnb
+```
+
+
+```{r}
+percent_yes = table(bank$y)[[2]]/dim(bank)[1]
+print(paste("percent of people who say yes", percent_yes))
+bank = read.table("C:/Users/willi/Desktop/bank-additional/bank-additional/bank-additional-full.csv", sep=";",header=T)
+mean_duration = (mean(bank$duration)/60)+2 
+print(paste("Avg Duration of call in min plus two minutes for transition:" ,mean_duration))
+hrl_rate=31.5 #average hrly salary of bank sales man in US
+num_cust=1400000 #The number of employees was aproximated by multipling 5191(from) data and 280 (customer to employee ratio, retreived from competitors)
+```
+
+In order to know how many customers to call a monte carlo simulation is run to capture customers that say yes from the .11 percent of the customers that actually say yes. 
+```{r}
+percent_called=1:100
+people =c() #pectent of the 11% of customers who will buy
+for(q in 1:100){
+#Monte Carlo Simulation
+l=c()
+for (i in 1:250){
+samp = sample(1:(dim(test)[1]), 1000)
+df=test[samp,]
+table(test$y)[[2]]/table(test$y)[[1]]
+df1=df[order(df$pred,decreasing = T),]
+dfcall= df1[1:(1000*q/100),]
+l=append(l,(table(dfcall$y)[[2]]/table(df$y)[[2]]))
+}
+people=append(people, mean(l))
+}
+da=data.frame(percent_called, people)
+plot(da)
+
+
+#Same plot but with number of people on the yaxis rather than percent of percent. 
+percent_called=1:100
+people =c() #pectent of the 11% of customers who will buy
+for(q in 1:100){
+#Monte Carlo Simulation
+l=c()
+for (i in 1:250){
+samp = sample(1:(dim(test)[1]), 1000)
+df=test[samp,]
+table(test$y)[[2]]/table(test$y)[[1]]
+df1=df[order(df$pred,decreasing = T),]
+dfcall= df1[1:(1000*q/100),]
+l=append(l,(table(dfcall$y)[[2]]/table(df$y)[[2]]))
+}
+people=append(people, ((mean(l)*0.1126542)*num_cust) )
+}
+da=data.frame(percent_called, people)
+plot(da)
+
+```
+
+Final Simulation using 18 percent of customers.
+```{r}
+#Monte Carlo Simulation
+l=c()
+for (i in 1:1000){
+samp = sample(1:(dim(test)[1]), 1000)
+df=test[samp,]
+table(test$y)[[2]]/table(test$y)[[1]]
+df1=df[order(df$pred,decreasing = T),]
+dfcall= df1[1:(1000*.18),]
+l=append(l,(table(dfcall$y)[[2]]/table(df$y)[[2]]))
+}
+
+
+#cost without model
+WM_cost_call=(num_cust/mean_duration)*hrl_rate
+  
+#cost with model
+M_cost_call=((num_cust*.18)/mean_duration)*hrl_rate
+
+#Savings
+s=WM_cost_call-M_cost_call
+s=formatC(s, format="d", big.mark=",")
+lower = formatC(as.integer(((mean(l)-2*sd(l)))*(percent_yes*num_cust)), format="d", big.mark=",")
+upper=formatC(as.integer((mean(l)+2*sd(l))*(percent_yes*num_cust)), format="d", big.mark=",")
+
+#Certainty from monte carlo simulation
+certainty= sum(l>(mean(l)-2*sd(l)) & l<(mean(l)+2*sd(l)))/length(l)
+hist((l*(percent_yes*num_cust)), main="Distribution of the Results of Simulation", xlab= "Number of Customers")
+print(paste("Based on the simulation by calling 18% of the customers there is ",certainty*100,"%"," certainty that the model will get between ",lower," and " ,upper," customers saving $",s, sep=''))
+
+```
+
+
+
+
+
+
+
+
+
+
+
